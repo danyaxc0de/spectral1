@@ -1,0 +1,395 @@
+name: Build APK
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v3
+      with:
+        gradle-version: '8.2'
+        
+    - name: Generate All Project Files
+      run: |
+        mkdir -p app/src/main/java/com/spectral/overlay
+        mkdir -p app/src/main/res/xml
+        mkdir -p app/src/main/res/values
+        mkdir -p app/src/main/res/drawable
+        mkdir -p app/src/main/assets
+
+        cat > settings.gradle << 'EOF'
+        pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+        dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+        rootProject.name = "spectral"
+        include ':app'
+        EOF
+
+        cat > build.gradle << 'EOF'
+        plugins {
+            id 'com.android.application' version '8.2.2' apply false
+            id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+        }
+        EOF
+
+        cat > gradle.properties << 'EOF'
+        org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+        android.useAndroidX=true
+        EOF
+
+        cat > app/build.gradle << 'EOF'
+        plugins {
+            id 'com.android.application'
+            id 'org.jetbrains.kotlin.android'
+        }
+        android {
+            namespace 'com.spectral.overlay'
+            compileSdk 34
+            defaultConfig {
+                applicationId "com.spectral.overlay"
+                minSdk 26
+                targetSdk 34
+                versionCode 1
+                versionName "1.0"
+            }
+            compileOptions {
+                sourceCompatibility JavaVersion.VERSION_17
+                targetCompatibility JavaVersion.VERSION_17
+            }
+            kotlinOptions { jvmTarget = '17' }
+        }
+        EOF
+
+        cat > app/src/main/AndroidManifest.xml << 'EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+            <application android:allowBackup="true" android:label="spectral" android:supportsRtl="true" android:theme="@android:style/Theme.Material.NoActionBar">
+                <activity android:name=".MainActivity" android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+                <service android:name=".BoardReader" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE" android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.accessibilityservice.AccessibilityService" />
+                    </intent-filter>
+                    <meta-data android:name="android.accessibilityservice" android:resource="@xml/access_service" />
+                </service>
+                <service android:name=".OverlayService" android:exported="false" />
+            </application>
+        </manifest>
+        EOF
+
+        cat > app/src/main/res/xml/access_service.xml << 'EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+            android:accessibilityEventTypes="typeWindowContentChanged|typeViewTextChanged"
+            android:accessibilityFeedbackType="feedbackGeneric"
+            android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
+            android:canRetrieveWindowContent="true" android:packageNames="com.chess" android:notificationTimeout="100" />
+        EOF
+
+        cat > app/src/main/res/values/colors.xml << 'EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <resources>
+            <color name="bg_black">#0A0A0A</color>
+            <color name="accent_red">#D32F2F</color>
+            <color name="accent_red_glow">#FF5252</color>
+            <color name="text_white">#F5F5F5</color>
+        </resources>
+        EOF
+
+        cat > app/src/main/res/drawable/menu_bg.xml << 'EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+            <gradient android:startColor="#1A1A1A" android:endColor="#0A0A0A" android:angle="90"/>
+            <corners android:radius="12dp"/>
+            <stroke android:width="1.5dp" android:color="#D32F2F"/>
+        </shape>
+        EOF
+
+        cat > app/src/main/java/com/spectral/overlay/MainActivity.kt << 'EOF'
+        package com.spectral.overlay
+        import android.app.Activity
+        import android.content.Intent
+        import android.net.Uri
+        import android.os.Bundle
+        import android.provider.Settings
+        class MainActivity : Activity() {
+            override fun onCreate(b: Bundle?) {
+                super.onCreate(b)
+                EngineBridge.ctx = applicationContext
+                if (!Settings.canDrawOverlays(this)) startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                else startService(Intent(this, OverlayService::class.java))
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                finish()
+            }
+        }
+        EOF
+
+        cat > app/src/main/java/com/spectral/overlay/BoardReader.kt << 'EOF'
+        package com.spectral.overlay
+        import android.accessibilityservice.AccessibilityService
+        import android.view.accessibility.AccessibilityEvent
+        import android.view.accessibility.AccessibilityNodeInfo
+        class BoardReader : AccessibilityService() {
+            override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                val root = rootInActiveWindow ?: return
+                val labels = mutableListOf<String>()
+                collect(root, labels)
+                if (labels.isNotEmpty()) BoardState.update(labels)
+            }
+            private fun collect(node: AccessibilityNodeInfo?, out: MutableList<String>) {
+                if (node == null) return
+                node.contentDescription?.toString()?.let { out.add(it) }
+                node.text?.toString()?.let { out.add(it) }
+                for (i in 0 until node.childCount) collect(node.getChild(i), out)
+            }
+            override fun onInterrupt() {}
+        }
+        EOF
+
+        cat > app/src/main/java/com/spectral/overlay/BoardState.kt << 'EOF'
+        package com.spectral.overlay
+        object BoardState {
+            private val squares = HashMap<String, String>()
+            var isWhiteTurn = true
+            fun update(labels: List<String>) {
+                squares.clear()
+                val re = Regex("^([a-h][1-8])[, ]+(.+)$", RegexOption.IGNORE_CASE)
+                for (s in labels) {
+                    val m = re.find(s) ?: continue
+                    squares[m.groupValues[1].lowercase()] = m.groupValues[2].lowercase()
+                }
+            }
+            fun getFen(): String? {
+                if (squares.isEmpty()) return null
+                val ranks = StringBuilder()
+                for (r in 8 downTo 1) {
+                    var empties = 0
+                    for (f in 'a'..'h') {
+                        val p = piece(squares["$f$r"])
+                        if (p == '1') empties++
+                        else { if (empties > 0) { ranks.append(empties); empties = 0 }; ranks.append(p) }
+                    }
+                    if (empties > 0) ranks.append(empties)
+                    if (r > 1) ranks.append('/')
+                }
+                val turn = if (isWhiteTurn) "w" else "b"
+                return "$ranks $turn KQkq - 0 1"
+            }
+            private fun piece(cell: String?): Char {
+                cell ?: return '1'
+                val s = cell.lowercase()
+                return when {
+                    s.contains("king") && s.contains("white") -> 'K'
+                    s.contains("king") && s.contains("black") -> 'k'
+                    s.contains("queen") && s.contains("white") -> 'Q'
+                    s.contains("queen") && s.contains("black") -> 'q'
+                    s.contains("rook") && s.contains("white") -> 'R'
+                    s.contains("rook") && s.contains("black") -> 'r'
+                    s.contains("bishop") && s.contains("white") -> 'B'
+                    s.contains("bishop") && s.contains("black") -> 'b'
+                    s.contains("knight") && s.contains("white") -> 'N'
+                    s.contains("knight") && s.contains("black") -> 'n'
+                    s.contains("pawn") && s.contains("white") -> 'P'
+                    s.contains("pawn") && s.contains("black") -> 'p'
+                    else -> '1'
+                }
+            }
+        }
+        EOF
+
+        cat > app/src/main/java/com/spectral/overlay/EngineBridge.kt << 'EOF'
+        package com.spectral.overlay
+        import android.content.Context
+        import java.io.File
+        object EngineBridge {
+            lateinit var ctx: Context
+            private var engineFile: File? = null
+            data class Result(val move: String, val score: Float)
+            fun ensureEngine(): File {
+                if (engineFile?.exists() == true) return engineFile!!
+                val f = File(ctx.filesDir, "stockfish")
+                if (!f.exists()) {
+                    ctx.assets.open("stockfish").use { input -> f.outputStream().use { output -> input.copyTo(output) } }
+                    f.setExecutable(true)
+                }
+                engineFile = f
+                return f
+            }
+            fun analyze(fen: String): Result {
+                val exe = ensureEngine()
+                val process = ProcessBuilder(exe.absolutePath).redirectErrorStream(true).start()
+                var bestMove = "e2e4"; var score = 0f
+                try {
+                    process.outputStream.bufferedWriter().use { writer ->
+                        writer.write("uci\nisready\nposition fen $fen\ngo depth 12\n"); writer.flush()
+                        val reader = process.inputStream.bufferedReader()
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.startsWith("info") && line.contains("score cp")) {
+                                val parts = line.split(" "); val idx = parts.indexOf("cp")
+                                if (idx != -1 && idx + 1 < parts.size) score = parts[idx + 1].toFloat() / 100f
+                            }
+                            if (line.startsWith("bestmove")) { bestMove = line.split(" ")[1]; break }
+                        }
+                    }
+                } catch (e: Exception) { e.printStackTrace() } finally { process.destroy() }
+                return Result(bestMove, score)
+            }
+        }
+        EOF
+
+        cat > app/src/main/java/com/spectral/overlay/OverlayService.kt << 'EOF'
+        package com.spectral.overlay
+        import android.app.*
+        import android.content.Intent
+        import android.graphics.PixelFormat
+        import android.os.Build
+        import android.os.IBinder
+        import android.view.Gravity
+        import android.view.View
+        import android.view.WindowManager
+        class OverlayService : Service() {
+            private lateinit var wm: WindowManager
+            private lateinit var arrowView: ArrowView
+            private lateinit var evalView: EvalBarView
+            private lateinit var menuView: MenuView
+            var arrow: Pair<String, String>? = null
+            var showArrow = true; var showEval = true
+            override fun onCreate() {
+                super.onCreate(); instance = this
+                val channelId = "spectral_channel"
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    val channel = NotificationChannel(channelId, "Spectral", NotificationManager.IMPORTANCE_LOW)
+                    getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+                }
+                val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Notification.Builder(this, channelId) else Notification.Builder(this)
+                startForeground(1, notification.setContentTitle("Spectral").setSmallIcon(android.R.drawable.ic_menu_view).build())
+                wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                arrowView = ArrowView(this)
+                wm.addView(arrowView, WindowManager.LayoutParams(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN, PixelFormat.TRANSLUCENT))
+                evalView = EvalBarView(this)
+                wm.addView(evalView, WindowManager.LayoutParams(60, 800, 40, 400, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE, PixelFormat.TRANSLUCENT))
+                menuView = MenuView(this)
+                menuParams = WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, 800, 200, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT)
+                menuParams.gravity = Gravity.TOP or Gravity.START
+                wm.addView(menuView, menuParams)
+            }
+            fun updateMenuPosition() { wm.updateViewLayout(menuView, menuParams) }
+            override fun onStartCommand(i: Intent?, f: Int, s: Int): Int = START_STICKY
+            override fun onBind(i: Intent?): IBinder? = null
+            companion object {
+                @Volatile var instance: OverlayService? = null
+                lateinit var menuParams: WindowManager.LayoutParams
+                fun forceHint() {
+                    val svc = instance ?: return
+                    val fen = BoardState.getFen() ?: return
+                    Thread {
+                        val res = EngineBridge.analyze(fen)
+                        svc.arrow = res.move.substring(0, 2) to res.move.substring(2, 4)
+                        svc.arrowView.post { svc.arrowView.visibility = if (svc.showArrow) View.VISIBLE else View.GONE; svc.arrowView.invalidate() }
+                        svc.evalView.post { svc.evalView.visibility = if (svc.showEval) View.VISIBLE else View.GONE; svc.evalView.setScore(res.score) }
+                    }.start()
+                }
+            }
+        }
+        EOF
+
+        cat > app/src/main/java/com/spectral/overlay/ArrowView.kt << 'EOF'
+        package com.spectral.overlay
+        import android.content.Context
+        import android.graphics.*
+        import android.view.View
+        class ArrowView(ctx: Context) : View(ctx) {
+            private val boardLeft = 40f; private val boardTop = 700f; private val boardSize = 1080f; private val cell = boardSize / 8f
+            private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeWidth = 18f; style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
+            init { setLayerType(LAYER_TYPE_SOFTWARE, null) }
+            override fun onDraw(canvas: Canvas) {
+                val a = OverlayService.instance?.arrow ?: return
+                val p1 = center(a.first); val p2 = center(a.second)
+                paint.setShadowLayer(25f, 0f, 0f, Color.parseColor("#FF5252"))
+                paint.shader = LinearGradient(p1.x, p1.y, p2.x, p2.y, intArrayOf(Color.TRANSPARENT, Color.parseColor("#D32F2F"), Color.WHITE), floatArrayOf(0f, 0.7f, 1f), Shader.TileMode.CLAMP)
+                canvas.drawLine(p1.x, p1.y, p2.x, p2.y, paint)
+                val ang = Math.atan2((p2.y - p1.y).toDouble(), (p2.x - p1.x).toDouble()); val len = 70f
+                val head = Path().apply {
+                    moveTo(p2.x, p2.y); lineTo(p2.x - len * Math.cos(ang + Math.PI / 5).toFloat(), p2.y - len * Math.sin(ang + Math.PI / 5).toFloat())
+                    moveTo(p2.x, p2.y); lineTo(p2.x - len * Math.cos(ang - Math.PI / 5).toFloat(), p2.y - len * Math.sin(ang - Math.PI / 5).toFloat())
+                }
+                paint.shader = null; paint.color = Color.WHITE; canvas.drawPath(head, paint)
+            }
+            private fun center(sq: String): PointF { val f = sq[0] - 'a'; val r = sq[1] - '1'; return PointF(boardLeft + (f + 0.5f) * cell, boardTop + (7 - r + 0.5f) * cell) }
+        }
+        EOF
+
+        cat > app/src/main/java/com/spectral/overlay/EvalBarView.kt << 'EOF'
+        package com.spectral.overlay
+        import android.content.Context
+        import android.graphics.*
+        import android.view.View
+        class EvalBarView(ctx: Context) : View(ctx) {
+            private val paint = Paint(Paint.ANTI_ALIAS_FLAG); private var evalScore = 0f
+            fun setScore(s: Float) { evalScore = s.coerceIn(-10f, 10f); invalidate() }
+            override fun onDraw(canvas: Canvas) {
+                val w = width.toFloat(); val h = height.toFloat()
+                paint.color = Color.parseColor("#0A0A0A"); canvas.drawRoundRect(0f, 0f, w, h, 8f, 8f, paint)
+                val whiteH = h * ((evalScore + 10f) / 20f)
+                paint.color = Color.parseColor("#F5F5F5"); canvas.drawRoundRect(0f, h - whiteH, w, h, 8f, 8f, paint)
+                paint.color = Color.parseColor("#D32F2F"); paint.strokeWidth = 4f; canvas.drawLine(0f, h - whiteH, w, h - whiteH, paint)
+                paint.textSize = 30f; paint.textAlign = Paint.Align.CENTER
+                canvas.drawText(if (evalScore > 0) "+%.1f".format(evalScore) else "%.1f".format(evalScore), w / 2, h / 2, paint)
+            }
+        }
+        EOF
+
+        cat > app/src/main/java/com/spectral/overlay/MenuView.kt << 'EOF'
+        package com.spectral.overlay
+        import android.content.Context
+        import android.graphics.Color
+        import android.graphics.Typeface
+        import android.view.Gravity
+        import android.view.MotionEvent
+        import android.view.View
+        import android.widget.*
+        class MenuView(ctx: Context) : LinearLayout(ctx) {
+            init {
+                orientation = VERTICAL; setBackgroundResource(R.drawable.menu_bg); setPadding(40, 30, 40, 30)
+                val title = TextView(ctx).apply { text = "SPECTRAL v5"; setTextColor(Color.parseColor("#D32F2F")); textSize = 18f; setTypeface(null, Typeface.BOLD); gravity = Gravity.CENTER }
+                addView(title)
+                addView(Button(ctx).apply { text = "GET HINT"; setBackgroundColor(Color.parseColor("#D32F2F")); setTextColor(Color.WHITE); setOnClickListener { OverlayService.forceHint() } })
+                addView(Switch(ctx).apply { text = " Play as White"; setTextColor(Color.parseColor("#F5F5F5")); isChecked = true; setOnCheckedChangeListener { _, c -> BoardState.isWhiteTurn = c } })
+                addView(Switch(ctx).apply { text = " Show Arrow"; setTextColor(Color.parseColor("#F5F5F5")); isChecked = true; setOnCheckedChangeListener { _, c -> OverlayService.instance?.showArrow = c } })
+                addView(TextView(ctx).apply { text = "TV: @BubMagnat"; setTextColor(Color.parseColor("#FF5252")); textSize = 14f; setTypeface(null, Typeface.ITALIC); gravity = Gravity.CENTER; setPadding(0, 20, 0, 0) })
+                title.setOnTouchListener(object : OnTouchListener {
+                    var initX = 0; var initY = 0; var tX = 0f; var tY = 0f
+                    override fun onTouch(v: View, e: MotionEvent): Boolean {
+                        when (e.action) {
+                            MotionEvent.ACTION_DOWN -> { initX = OverlayService.menuParams.x; initY = OverlayService.menuParams.y; tX = e.rawX; tY = e.rawY; return true }
+                            MotionEvent.ACTION_MOVE -> { OverlayService.menuParams.x = initX + (e.rawX - tX).toInt(); OverlayService.menuParams.y = initY + (e.rawY - tY).toInt(); OverlayService.instance?.updateMenuPosition(); return true }
+                        }
+                        return false
+                    }
+                })
+            }
+        }
+        EOF
+
+        curl -L -o app/src/main/assets/stockfish https://github.com/official-stockfish/Stockfish/releases/download/sf_16/stockfish-android-armv8
+        chmod +x app/src/main/assets/stockfish
+
+    - name: Build with Gradle
+      run: gradle :app:assembleDebug
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: spectral-apk
+        path: app/build/outputs/apk/debug/app-debug.apk
